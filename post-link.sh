@@ -2,8 +2,6 @@
 
 # ==============================================================================
 # GMA Post-Installation Script
-# 1. Configure SnpEff DB (Link & Config)
-# 2. Update TB-Profiler DB
 # ==============================================================================
 
 LOG_FILE="$PREFIX/.messages.txt"
@@ -12,7 +10,7 @@ echo "=== GenoMycAnalyzer Post-Installation Setup ===" >> "$LOG_FILE"
 # ------------------------------------------------------------------------------
 # 1. SnpEff DB Configuration
 # ------------------------------------------------------------------------------
-GMA_DB_DIR="${PREFIX}/share/GMA/db/snpEff/data/H37Rv"
+GMA_DB_DIR="${PREFIX}/share/GMA/snpEff_DB/data/H37Rv"
 SNPEFF_JAR=$(find ${PREFIX}/share -name "snpEff.jar" | head -n 1)
 
 if [ -n "$SNPEFF_JAR" ]; then
@@ -22,6 +20,9 @@ if [ -n "$SNPEFF_JAR" ]; then
     if [ -d "${SNPEFF_HOME}/data/H37Rv" ] && [ ! -L "${SNPEFF_HOME}/data/H37Rv" ]; then
         mv "${SNPEFF_HOME}/data/H37Rv" "${SNPEFF_HOME}/data/H37Rv_backup_pkg"
     fi
+    
+    rm -f "${SNPEFF_HOME}/data/H37Rv"
+    
     ln -sfn "$GMA_DB_DIR" "${SNPEFF_HOME}/data/H37Rv"
     
     SNPEFF_CONFIG="${SNPEFF_HOME}/snpEff.config"
