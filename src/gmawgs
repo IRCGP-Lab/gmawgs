@@ -521,9 +521,9 @@ process_sample() {
               echo "[WARNING] Bracken failed for ${sample}." | tee -a "${ERROR_LOG}"
           else
               echo "Bracken passed for ${sample}."
-              #rm -f "${RESULTS}/8_Kraken2/${sample}.kraken" \
-              #      "${RESULTS}/8_Kraken2/${sample}.kreport" \
-              #      "${RESULTS}/8_Kraken2/${sample}_bracken_species.kreport"
+              rm -f "${RESULTS}/8_Kraken2/${sample}.kraken" \
+                    "${RESULTS}/8_Kraken2/${sample}.kreport" \
+                    "${RESULTS}/8_Kraken2/${sample}_bracken_species.kreport"
           fi
       fi
   fi
