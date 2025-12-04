@@ -21,8 +21,7 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
-# OpenPyXL Illegal Character Regex
-# Excel does not support ASCII control characters 0x00-0x1F (except 0x09, 0x0A, 0x0D)
+# [Added] OpenPyXL Illegal Character Regex
 ILLEGAL_CHARACTERS_RE = re.compile(r'[\000-\010]|[\013-\014]|[\016-\037]')
 
 def clean_text(text):
@@ -94,7 +93,7 @@ DRUG_FULL_NAMES = {
     "STM": "Streptomycin (STM)", "KAN": "Kanamycin (KAN)", "ETO": "Ethionamide (ETO)"
 }
 
-# TB-Profiler Name Mapping (Long -> Short)
+# TB-Profiler Name Mapping (Long -> Short) for gDST derivation
 TBP_NAME_MAP = {
     "rifampicin": "RIF", "isoniazid": "INH", "ethambutol": "EMB", "pyrazinamide": "PZA",
     "moxifloxacin": "MFX", "levofloxacin": "LFX", "bedaquiline": "BDQ", "delamanid": "DLM",
@@ -103,7 +102,7 @@ TBP_NAME_MAP = {
     "para-aminosalicylic_acid": "PAS", "cycloserine": "CS"
 }
 
-# TB-Profiler Drug Order (GMA order + PA, PAS, CS)
+# TB-Profiler Drug Order for gDST columns
 TBP_DRUG_ORDER = SUMMARY_DRUG_ORDER + ["PA", "PAS", "CS"]
 
 # QC Stats Columns
@@ -116,8 +115,12 @@ MAPPING_STATS_COLS = ["Coverage_depth", "1X_coverage_rate", "50X_coverage_rate",
 
 BRACKEN_COLS = ["Species", "Species_Reads", "Species_Fraction"]
 
+# [MODIFIED] GMA Summary Column Order: All Mutations -> All gDSTs
 DEFAULT_SUMMARY_COLUMNS = ["Sample", "Species", "Main_lineage", "Sub_lineage", "Spoligotype", "DR_Type",
                            "Coverage_depth", "WGS_QC", "RAV_count", "Other_variant_count"]
+# 1. All Mutations first (GMA Rule)
+for d in SUMMARY_DRUG_ORDER: DEFAULT_SUMMARY_COLUMNS.append(f"{d}_Mutation")
+# 2. All gDST results second (GMA Rule)
 for d in SUMMARY_DRUG_ORDER: DEFAULT_SUMMARY_COLUMNS.append(f"{d}_gDST")
 DEFAULT_SUMMARY_COLUMNS.append("Large_deletion") 
 
@@ -125,8 +128,10 @@ ALL_SUMMARY_COLUMNS = ["Sample", "Species", "Species_Reads", "Species_Fraction",
                        "Main_lineage", "Sub_lineage", "Spoligotype", "DR_Type"]
 ALL_SUMMARY_COLUMNS.extend(QC_RAW_COLS)
 ALL_SUMMARY_COLUMNS.extend(MAPPING_STATS_COLS)
-ALL_SUMMARY_COLUMNS.extend(["WGS_QC", "RAV_count", "Other_variant_count", "Large_deletion"])
+ALL_SUMMARY_COLUMNS.extend(["WGS_QC", "RAV_count", "Other_variant_count", "Large_deletion"]) 
+# 1. All Mutations first (GMA Rule)
 for d in SUMMARY_DRUG_ORDER: ALL_SUMMARY_COLUMNS.append(f"{d}_Mutation")
+# 2. All gDST results second (GMA Rule)
 for d in SUMMARY_DRUG_ORDER: ALL_SUMMARY_COLUMNS.append(f"{d}_gDST")
 
 # ----------------------------------------------------------------------
@@ -154,6 +159,7 @@ def init_sample(sample):
 # DB Loading & Helper Functions
 # ----------------------------------------------------------------------
 CONVERT_DB = {}
+# [Fixed] Resolve path relative to this script location (No ENV dependency)
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONVERT_DB_PATH = os.path.join(SCRIPT_DIR, "Variant_convert_DB.xlsx")
 
@@ -342,7 +348,7 @@ def judge_wgs_qc(q30_rate, depth, sp_frac):
 def transform_hit(hit):
     try: vaf = float(hit.split("_")[-1])
     except: return hit
-    if vaf < 10: return "**-"
+    if vaf < 10: return "-"
     elif vaf < 75: return "*" + hit
     return hit
 
@@ -706,9 +712,21 @@ if args.merge_reports:
         print(f"[INFO] Using specified TB-Profiler summary: {tb_summary_file}")
     else:
         tb_files = glob.glob(os.path.join(tb_results_dir, "*.txt"))
-        if tb_files:
-            tb_summary_file = tb_files[0]
-            print(f"[INFO] Automatically detected TB-Profiler summary: {tb_summary_file}")
+        # [FIXED] Filter out unwanted TBP intermediate files (.dr.txt, .itol.txt, .variants.txt)
+        # Use stricter 'in' check for safety
+        candidates = [
+            f for f in tb_files 
+            if ".distance_matrix" not in os.path.basename(f)
+            and ".itol" not in os.path.basename(f)
+            and ".variants" not in os.path.basename(f)
+            and ".dr" not in os.path.basename(f)
+            and ".lineage" not in os.path.basename(f)
+        ]
+        if candidates:
+             # Sort by length (shortest filename is typically the main summary)
+             candidates.sort(key=len)
+             tb_summary_file = candidates[0]
+             print(f"[INFO] Automatically detected TB-Profiler summary: {tb_summary_file}")
     
     if not tb_summary_file:
         print(f"[WARN] No TB-Profiler summary text file found in {tb_results_dir}")

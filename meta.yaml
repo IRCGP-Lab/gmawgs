@@ -1,6 +1,6 @@
 package:
   name: gma
-  version: "1.1.2"
+  version: "1.1.3"
 
 source:
   path: src
@@ -23,7 +23,7 @@ requirements:
     - cutadapt
     - fastqc
     - seqkit
-    - tb-profiler
+    - tb-profiler =6.6.6
 
 test:
   commands:

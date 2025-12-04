@@ -103,9 +103,9 @@ done
 # Set Default Batch ID based on mode if not provided
 if [ -z "$Batch" ]; then
     if [ "$SUMMARY_ONLY" = true ]; then
-        Batch="GenoMycAnalyzer_Summary_$(date +%Y%m%d)"
+        Batch="gma_Summary_$(date +%Y%m%d)"
     else
-        Batch="GenoMycAnalyzer_$(date +%Y%m%d)"
+        Batch="gma_$(date +%Y%m%d)"
     fi
 fi
 
@@ -284,20 +284,74 @@ run_spotyping() {
     conda deactivate
 }
 
-# 2. Check environment existence and install (Runs only once)
-if ! conda info --envs | grep -q "$SPOTYPING_ENV_NAME"; then
-    echo "----------------------------------------------------------"
-    echo "[System] Python 2.7 environment for SpoTyping is missing."
-    echo "[System] Creating auxiliary environment ($SPOTYPING_ENV_NAME) automatically..."
-    echo "----------------------------------------------------------"
+# 2. Check environment existence and install (Robust Logic for Both Batch & Slurm)
+# Only run this check if NOT in summary mode
+if [ "$SUMMARY_ONLY" = false ]; then
     
-    conda create -n "$SPOTYPING_ENV_NAME" -c bioconda spotyping blast python=2.7 -y
-    
-    if [ $? -eq 0 ]; then
-        echo "[Success] Auxiliary environment created successfully!"
-    else
-        echo "[Error] Failed to create SpoTyping environment. Check internet connection."
-        # Proceed even if failed (will be skipped)
+    # Check if env exists AND is valid (contains Spotyping)
+    # [FIX] Stricter check to ensure env is usable
+    ENV_EXISTS=false
+    if conda info --envs | grep -q "${SPOTYPING_ENV_NAME}$"; then
+        # Even if listed, check if it has the tool (handling broken installs)
+        if [ -d "${GMA_ROOT}/../${SPOTYPING_ENV_NAME}" ]; then
+             ENV_EXISTS=true
+        fi
+    fi
+
+    if [ "$ENV_EXISTS" = false ]; then
+        
+        # [FIX] Determine if running in Parallel (Slurm) or Single (Terminal)
+        # If SLURM_JOB_ID is present, we use locking. If not, we install directly.
+        if [ -n "$SLURM_JOB_ID" ]; then
+            IS_PARALLEL=true
+        else
+            IS_PARALLEL=false
+        fi
+
+        if [ "$IS_PARALLEL" = true ]; then
+            # --- Slurm Parallel Mode (Use Atomic Lock) ---
+            LOCK_DIR="${GMA_ROOT}/../${SPOTYPING_ENV_NAME}_install_lock"
+            
+            # Try to acquire lock
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo "----------------------------------------------------------"
+                echo "[System] Installing auxiliary env ($SPOTYPING_ENV_NAME)... (Locked)"
+                echo "----------------------------------------------------------"
+                
+                conda create -n "$SPOTYPING_ENV_NAME" -c bioconda spotyping blast python=2.7 -y
+                rmdir "$LOCK_DIR"
+            else
+                echo "----------------------------------------------------------"
+                echo "[System] Waiting for another job to install $SPOTYPING_ENV_NAME..."
+                echo "----------------------------------------------------------"
+                
+                # Wait loop
+                MAX_RETRIES=60
+                count=0
+                while [ $count -lt $MAX_RETRIES ]; do
+                    if conda info --envs | grep -q "${SPOTYPING_ENV_NAME}$"; then
+                        echo "[System] Environment detected. Proceeding."
+                        break
+                    fi
+                    sleep 10
+                    count=$((count + 1))
+                done
+            fi
+        else
+            # --- Terminal Batch Mode (Direct Install) ---
+            echo "----------------------------------------------------------"
+            echo "[System] Installing auxiliary env ($SPOTYPING_ENV_NAME)..."
+            echo "----------------------------------------------------------"
+            # Force install/reinstall if missing
+            conda create -n "$SPOTYPING_ENV_NAME" -c bioconda spotyping blast python=2.7 -y
+        fi
+        
+        # Final check
+        if [ $? -eq 0 ]; then
+            echo "[Success] Auxiliary environment ready."
+        else
+            echo "[Error] Failed to setup SpoTyping environment."
+        fi
     fi
 fi
 
@@ -611,15 +665,16 @@ process_sample() {
 
   ##############################################################################
   # Variant calling (bcftools) (Critical)
+  # [MODIFIED] Changed order: High-Conf MNV Merge -> Combine with Low-Conf
   ##############################################################################
   if [ -f "${RESULTS}/6_Variant_Call/${sample}_filtered.vcf" ]; then
       echo ">>> Variant calling already done for ${sample}. Skipping."
   else
       echo "$(date) ============== Variant calling Start: ${sample}"
 
-  # !!Whole-genome sequencing 
-      # Call 1 (Filtered sites)
-      bcftools mpileup -d 8000 -L 8000 -Ou --threads "${THREADS}" \
+      # 1. Call 1: High Confidence (Filtered sites)
+      # [FIX] Added -B to disable BAQ calculation
+      bcftools mpileup -B -d 8000 -L 8000 -Ou --threads "${THREADS}" \
           -f "${REFER}" \
           "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
         | bcftools call -Ov --ploidy 1 --threads "${THREADS}" -v -c \
@@ -627,12 +682,35 @@ process_sample() {
       
       if [ $? -ne 0 ]; then echo "[ERROR] Variant Calling(1) failed" | tee -a "${ERROR_LOG}"; return 1; fi
 
+      # Filter High Confidence Variants
       bcftools view -e 'QUAL <= 30 || DP <= 30 || (DP4[2]+DP4[3])/(DP4[0]+DP4[1]+DP4[2]+DP4[3]) < 0.75 || (DP4[2]+DP4[3]) < 4' \
           "${RESULTS}/6_Variant_Call/${sample}.vcf" \
           > "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf"
+          
+      # 2. [NEW] Apply Consequence Merging (MNV) ONLY to High Confidence Variants
+      if [ "$consequence" = "on" ]; then
+          echo ">>> Running consequence (MNV merging) on High-Conf VCF for ${sample}..."
+          # Call python script with explicit suffixes: _filtered_1.vcf -> _filtered_1_sum.vcf
+          python "${GMA_SHARE}/merge_vcf_Array_v1.2.py" \
+              "${RESULTS}/6_Variant_Call" \
+              "${RESULTS}/6_Variant_Call" \
+              "${sample}" \
+              "_filtered_1.vcf" \
+              "_filtered_1_sum.vcf"
+              
+          # Check if sum file was created (it might not be if no variants)
+          if [ ! -f "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf" ]; then
+               # If failed or no variants, just copy original
+               cp "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf" "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+          fi
+      else
+          # If consequence is off, just copy
+          cp "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf" "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+      fi
 
-      # Call 2 (All sites)
-      bcftools mpileup -d 8000 -L 8000 -Ou --threads "${THREADS}" \
+      # 3. Call 2: Low Confidence (All sites, for drug resistance)
+      # [FIX] Added -B to disable BAQ calculation
+      bcftools mpileup -B -d 8000 -L 8000 -Ou --threads "${THREADS}" \
           -f "${REFER}" \
           "${RESULTS}/4_Aligned_Bams/${sample}_dup_removed.bam" \
         | bcftools call -Ov --ploidy 1 --threads "${THREADS}" -A -c \
@@ -647,15 +725,17 @@ process_sample() {
           -b "${GMA_SHARE}/WHODR_v2.bed" \
           > "${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
 
-      # Merge
+      # 4. Merge: (High-Conf MNV Merged) + (Low-Conf)
+      # Note: Using _filtered_1_sum.vcf instead of _filtered_1.vcf
       {
-        grep '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf"
+        grep '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
         {
-          grep -v '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1.vcf"
+          grep -v '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
           grep -v '^#' "${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
         } | sort -k2,2n -u
       } > "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf"
 
+      # Final Filter (Just to be safe)
       bcftools view -e 'DP <= 30 || (DP4[2]+DP4[3])/(DP4[0]+DP4[1]+DP4[2]+DP4[3]) < 0.01 || (DP4[2]+DP4[3]) < 4' \
           "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf" \
           > "${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"
@@ -814,13 +894,8 @@ fi
 if [ -n "$TARGET_SAMPLE" ]; then
     echo ">>> Single sample mode finished. Skipping batch aggregation."
     
-    # Run consequence (merge_vcf) if enabled for Single Sample Mode
-    if [ "$consequence" = "on" ]; then
-        echo ">>> Running consequence (merge_vcf_Array.py) for ${TARGET_SAMPLE}..."
-        # [FIX] Use calculated GMA_SHARE path
-        python "${GMA_SHARE}/merge_vcf_Array_v1.1.py" \
-            "${RESULTS}/6_Variant_Call" "${RESULTS}/6_Variant_Call" "${TARGET_SAMPLE}"
-    fi
+    # [REMOVED] Old consequence logic (moved inside process_sample)
+    # if [ "$consequence" = "on" ]; then ... fi
     
     # Run snpEff only for this sample
     echo ">>> snpEff per sample..."
@@ -829,10 +904,8 @@ if [ -n "$TARGET_SAMPLE" ]; then
     if [ -f "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}.ann.tsv" ]; then
         echo ">>> snpEff already done for ${TARGET_SAMPLE}. Skipping."
     else
-        vcf_file="${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_sum.vcf"
-        if [ "$consequence" = "off" ] || [ ! -f "$vcf_file" ]; then 
-            vcf_file="${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered.vcf"
-        fi
+        # [UPDATED] Correct input file is now _filtered.vcf (merged from High+Low)
+        vcf_file="${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered.vcf"
         
         if [ -f "$vcf_file" ]; then
             snpEff H37Rv "$vcf_file" \
@@ -852,7 +925,7 @@ if [ -n "$TARGET_SAMPLE" ]; then
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_1~3.vcf" \
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_A.vcf" \
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_1.vcf" \
-          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_sum.vcf" \
+          "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_filtered_1_sum.vcf" \
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_merge.vcf" \
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_N_ALT.vcf" \
           "${RESULTS}/6_Variant_Call/${TARGET_SAMPLE}_sorted_merge.vcf" \
@@ -868,7 +941,7 @@ fi
 
 echo ">>> Starting Aggregation / Summary Phase..."
 
-# Prepare arguments for make_variants_WGS_v1.py
+# Prepare arguments for make_variants_WGS_v1.3.py
 MAKE_VAR_OPTS=""
 if [ -n "$MIN_VAF" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --min_vaf $MIN_VAF"; fi
 if [ -n "$MAX_WHO_GROUP" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --max_who_group $MAX_WHO_GROUP"; fi
@@ -876,17 +949,17 @@ if [ -n "$USER_COLUMNS" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --columns $USER_CO
 if [ "$ALL_COLUMNS" = true ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --all_columns"; fi
 if [ "$GENERATE_PDF" = true ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --pdf"; fi
 
-echo ">>> consequence option = $consequence"
-if [ "$consequence" = "on" ]; then
-    python "${GMA_SHARE}/merge_vcf_Array_v1.1.py" "${RESULTS}/6_Variant_Call" "${RESULTS}/6_Variant_Call"
-fi
+# [REMOVED] Old batch consequence logic (moved inside process_sample)
+# if [ "$consequence" = "on" ]; then ... fi
 
 # snpEff loop for batch mode
 snpeff_sample() {
   local sample="$1"
   if [ -f "${RESULTS}/6_Variant_Call/${sample}.ann.tsv" ]; then return 0; fi
-  vcf_file="${RESULTS}/6_Variant_Call/${sample}_filtered_sum.vcf"
-  if [ "$consequence" = "off" ] || [ ! -f "$vcf_file" ]; then vcf_file="${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"; fi
+
+  # Final VCF is always _filtered.vcf in the new logic
+  vcf_file="${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"
+
   if [ ! -f "$vcf_file" ]; then return 0; fi
 
   snpEff H37Rv "$vcf_file" \
@@ -957,8 +1030,10 @@ if [ "$MERGE_REPORTS" = true ]; then
 fi
 
 echo ">>> Making variants report with options: $MAKE_VAR_OPTS"
-python "${GMA_SHARE}/make_variants_WGS_v1.2.py" \
-    "${RESULTS}/6_Variant_Call" "${RESULTS}/GMA_${Batch}.variants.tsv" \
+# Removed "GMA_" prefix from the output filename
+# [FIX] Updated to call v1.3 python script
+python "${GMA_SHARE}/make_variants_WGS_v1.3.py" \
+    "${RESULTS}/6_Variant_Call" "${RESULTS}/${Batch}.variants.tsv" \
     $MAKE_VAR_OPTS
 
 echo ">>> All done."
