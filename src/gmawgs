@@ -941,7 +941,7 @@ fi
 
 echo ">>> Starting Aggregation / Summary Phase..."
 
-# Prepare arguments for make_variants_WGS_v1.3.py
+# Prepare arguments for make_variants_WGS_v1.4.py
 MAKE_VAR_OPTS=""
 if [ -n "$MIN_VAF" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --min_vaf $MIN_VAF"; fi
 if [ -n "$MAX_WHO_GROUP" ]; then MAKE_VAR_OPTS="$MAKE_VAR_OPTS --max_who_group $MAX_WHO_GROUP"; fi
@@ -1031,8 +1031,8 @@ fi
 
 echo ">>> Making variants report with options: $MAKE_VAR_OPTS"
 # Removed "GMA_" prefix from the output filename
-# [FIX] Updated to call v1.3 python script
-python "${GMA_SHARE}/make_variants_WGS_v1.3.py" \
+# [FIX] Updated to call v1.4 python script
+python "${GMA_SHARE}/make_variants_WGS_v1.4.py" \
     "${RESULTS}/6_Variant_Call" "${RESULTS}/${Batch}.variants.tsv" \
     $MAKE_VAR_OPTS
 

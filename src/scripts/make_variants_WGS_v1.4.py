@@ -134,6 +134,45 @@ for d in SUMMARY_DRUG_ORDER: ALL_SUMMARY_COLUMNS.append(f"{d}_Mutation")
 # 2. All gDST results second (GMA Rule)
 for d in SUMMARY_DRUG_ORDER: ALL_SUMMARY_COLUMNS.append(f"{d}_gDST")
 
+
+# [NEW] Strictly Defined Final Column Order for Excel Report
+FINAL_COLUMN_ORDER = [
+    "Sample", "Species", "Species_Reads", "Species_Fraction",
+    "Main_lineage", "Sub_lineage", "TBP_main_lineage", "TBP_sub_lineage",
+    "Spoligotype", "TBP_spoligotype",
+    "DR_Type", "TBP_drtype",
+    "Total_reads_raw", "Total_bases_raw", "Q30_reads_rate_raw",
+    "Total_reads_filtered", "Total_bases_filtered", "Q30_reads_rate_filtered",
+    "Coverage_depth", "TBP_target_median_depth",
+    "1X_coverage_rate", "50X_coverage_rate", "100X_coverage_rate",
+    "Mapped_reads", "TBP_num_reads_mapped",
+    "Mapped_rate", "TBP_pct_reads_mapped",
+    "Mapping_quality",
+    "Duplicated_reads", "Duplication_rate",
+    "Read_length", "Insert_size", "Base_quality",
+    "WGS_QC",
+    "RAV_count", "Other_variant_count",
+    "TBP_num_dr_variants", "TBP_num_other_variants",
+    "Large_deletion"
+]
+
+# Add Drug Columns Iteratively
+# Order: RIF, INH, LFX, MFX, LZD, BDQ, CFZ, DLM, PZA, EMB, AMK, CAP, STM, KAN, ETO
+for d in SUMMARY_DRUG_ORDER:
+    FINAL_COLUMN_ORDER.extend([
+        f"{d}_gDST", f"TBP_{d}_gDST",
+        f"{d}_Mutation", f"TBP_{d}_Mutation"
+    ])
+
+# Add Extra TB-Profiler Drugs (PA, PAS, CS)
+# PA: TBP_PA_gDST, TBP_PA_Mutation
+FINAL_COLUMN_ORDER.extend(["TBP_PA_gDST", "TBP_PA_Mutation"])
+# PAS: TBP_PAS_gDST, TBP_PAS_Mutation
+FINAL_COLUMN_ORDER.extend(["TBP_PAS_gDST", "TBP_PAS_Mutation"])
+# CS: TBP_CS_gDST, TBP_CS_Mutation
+FINAL_COLUMN_ORDER.extend(["TBP_CS_gDST", "TBP_CS_Mutation"])
+
+
 # ----------------------------------------------------------------------
 # Structures
 # ----------------------------------------------------------------------
@@ -348,7 +387,9 @@ def judge_wgs_qc(q30_rate, depth, sp_frac):
 def transform_hit(hit):
     try: vaf = float(hit.split("_")[-1])
     except: return hit
-    if vaf < 10: return "-"
+    
+    # [MODIFIED] Return None instead of "**-" or "-" to indicate this variant should be filtered out
+    if vaf < 10: return None 
     elif vaf < 75: return "*" + hit
     return hit
 
@@ -566,7 +607,12 @@ with open(merged_tsv, "w", newline="", encoding="utf-8") as out_m:
         for drug in SUMMARY_DRUG_ORDER:
             row_data[f"{drug}_gDST"] = calls.get(drug, "S")
             hits = hits_dict.get(drug, [])
-            row_data[f"{drug}_Mutation"] = ";".join([transform_hit(h) for h in hits]) if hits else "-"
+            
+            # [MODIFIED] Correct logic to filter out low VAF variants (which are returned as None)
+            processed_hits = [transform_hit(h) for h in hits]
+            valid_hits = [h for h in processed_hits if h is not None] # Filter out None
+            
+            row_data[f"{drug}_Mutation"] = ";".join(valid_hits) if valid_hits else "-"
         
         out_row = [row_data.get(col, "") for col in target_columns]
         writer.writerow(out_row)
@@ -712,8 +758,6 @@ if args.merge_reports:
         print(f"[INFO] Using specified TB-Profiler summary: {tb_summary_file}")
     else:
         tb_files = glob.glob(os.path.join(tb_results_dir, "*.txt"))
-        # [FIXED] Filter out unwanted TBP intermediate files (.dr.txt, .itol.txt, .variants.txt)
-        # Use stricter 'in' check for safety
         candidates = [
             f for f in tb_files 
             if ".distance_matrix" not in os.path.basename(f)
@@ -723,7 +767,6 @@ if args.merge_reports:
             and ".lineage" not in os.path.basename(f)
         ]
         if candidates:
-             # Sort by length (shortest filename is typically the main summary)
              candidates.sort(key=len)
              tb_summary_file = candidates[0]
              print(f"[INFO] Automatically detected TB-Profiler summary: {tb_summary_file}")
@@ -732,184 +775,163 @@ if args.merge_reports:
         print(f"[WARN] No TB-Profiler summary text file found in {tb_results_dir}")
         print("        Ensure '--run-tbprofiler' was used and 'collate' step finished.")
     else:
-        tb_data = {} # {sample: {drug: mutation_string}}
-        tb_raw_rows = {} # {sample: [raw_columns_list]}
-        tb_raw_header = []
-
-        # 1. Read TB-Profiler Data (Parsing with Mapping + Raw Storage)
+        tb_records = {} # { sample: { "TBP_INH_Mutation": "val", "TBP_main_lineage": "val" } }
+        
+        # 1. Read and Standardize TB-Profiler Data
         try:
             with open(tb_summary_file, "r", encoding="utf-8", errors='replace') as f:
                 reader = csv.reader(f, delimiter="\t")
-                
-                # Header processing
                 header_row = next(reader, None)
+                
                 if header_row and len(header_row) > 1:
-                    # Store raw header (exclude sample col) for appending later
-                    tb_raw_header = [f"TBP_Result_{c}" for c in header_row[1:]]
-                    
-                    # Create mapping for gDST derivation
-                    header_map = {}
+                    # Create mapping from Index -> Standardized TBP Column Name
+                    tbp_idx_map = {}
                     for i, col_name in enumerate(header_row):
-                        if i == 0: continue # skip sample col
-                        short_name = TBP_NAME_MAP.get(col_name, col_name)
-                        header_map[i] = short_name
-
-                    # Row processing
-                    for row in reader:
-                        if row:
-                            sample_id = row[0]
-                            # Store raw data for "Left Join" style appending
-                            tb_raw_rows[sample_id] = row[1:]
-                            
-                            # Store mapped data for gDST calculation
-                            tb_data[sample_id] = {}
-                            for i, val in enumerate(row):
-                                if i == 0: continue
-                                drug_key = header_map.get(i)
-                                if drug_key:
-                                    tb_data[sample_id][drug_key] = val
-
-        except Exception as e:
-            print(f"[ERROR] Could not read TB-Profiler file: {e}")
-            
-        if tb_data:
-            # 3. Create Integrated Excel File (.xlsx)
-            integrated_xlsx = merged_tsv.replace(".gDST_summary.tsv", ".Integrated_Report.xlsx")
-            if integrated_xlsx == merged_tsv: integrated_xlsx += ".xlsx"
-            
-            try:
-                # Excel creation logic
-                from openpyxl import Workbook
-                from openpyxl.styles import Alignment, Font, PatternFill
-
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Integrated Report"
-                
-                # Load GMA rows (for re-writing to excel)
-                gma_rows = []
-                with open(merged_tsv, "r", encoding="utf-8") as gma_f:
-                    gma_reader = csv.reader(gma_f, delimiter="\t")
-                    gma_header = next(gma_reader, None)
-                    if gma_header:
-                        for row in gma_reader: gma_rows.append(row)
-                
-                if gma_header:
-                    # Construct Header Columns
-                    # Part 1: TBP Derived gDSTs (Grouped)
-                    tbp_derived_header = []
-                    for drug in TBP_DRUG_ORDER:
-                        tbp_derived_header.append(f"TBP_{drug}_gDST")
-                    
-                    # Part 2: TBP Raw Result Columns (Left Join Style)
-                    # (already stored in tb_raw_header with prefixes)
-
-                    # Total Columns Calculation
-                    gma_len = len(gma_header)
-                    tbp_derived_len = len(tbp_derived_header)
-                    tbp_raw_len = len(tb_raw_header)
-                    total_len = gma_len + tbp_derived_len + tbp_raw_len
-                    
-                    # [Safety] Check Column Limit (Excel Max 16384)
-                    if total_len > 16000:
-                        print(f"[WARN] Total columns ({total_len}) exceeds safety limit. Truncating TB-Profiler columns.")
-                        # Simple truncation logic (prioritize derived gDST)
-                        allowed_raw = 16000 - gma_len - tbp_derived_len
-                        if allowed_raw < 0: allowed_raw = 0
-                        tb_raw_header = tb_raw_header[:allowed_raw]
-                        tbp_raw_len = len(tb_raw_header)
-                        total_len = gma_len + tbp_derived_len + tbp_raw_len
-
-                    # --- Row 1: Super Header (Merged Cells) ---
-                    # GMA Section
-                    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=gma_len)
-                    c1 = ws.cell(row=1, column=1, value="GenoMycAnalyzer-WGS")
-                    c1.alignment = Alignment(horizontal='center', vertical='center')
-                    c1.font = Font(bold=True, size=12)
-                    
-                    # TB-Profiler Section
-                    ws.merge_cells(start_row=1, start_column=gma_len+1, end_row=1, end_column=total_len)
-                    c2 = ws.cell(row=1, column=gma_len+1, value="TB-Profiler")
-                    c2.alignment = Alignment(horizontal='center', vertical='center')
-                    c2.font = Font(bold=True, size=12)
-
-                    # --- Row 2: Main Header (Styled) ---
-                    full_header = gma_header + tbp_derived_header + tb_raw_header
-                    # Clean header strings
-                    full_header = [clean_text(h) for h in full_header]
-                    ws.append(full_header) # Writes to next available row (Row 2)
-                    
-                    header_fill = PatternFill(start_color="DDDDDD", end_color="DDDDDD", fill_type="solid")
-                    for col_num in range(1, total_len + 1):
-                        cell = ws.cell(row=2, column=col_num)
-                        cell.font = Font(bold=True)
-                        cell.fill = header_fill
-                        cell.alignment = Alignment(horizontal='center')
-
-                    # --- Row 3+: Data ---
-                    for row in gma_rows:
-                        sample_id = row[0]
+                        if i == 0: continue # Skip sample ID
                         
-                        # 1. Prepare TBP Derived gDST Data
-                        tbp_derived_data = []
-                        sample_tb_data = tb_data.get(sample_id, {})
-                        
-                        for drug in TBP_DRUG_ORDER:
-                            mutation_val = sample_tb_data.get(drug, "-")
-                            if mutation_val and mutation_val != "-":
-                                gdst_val = "R"
+                        # Logic: Check if it's a drug
+                        if col_name in TBP_NAME_MAP:
+                            short_drug = TBP_NAME_MAP[col_name]
+                            std_name = f"TBP_{short_drug}_Mutation"
+                        else:
+                            # Metadata (e.g. main_lineage, dr_type)
+                            # Convert 'dr_type' -> 'drtype' if needed for consistency, or keep as is
+                            # User requested specific list like 'TBP_main_lineage', 'TBP_drtype'
+                            # We map common header names to the requested format
+                            if col_name == "dr_type": std_name = "TBP_drtype"
+                            elif col_name == "main_lineage": std_name = "TBP_main_lineage"
+                            elif col_name == "sub_lineage": std_name = "TBP_sub_lineage"
+                            elif col_name == "spoligotype": std_name = "TBP_spoligotype"
+                            elif col_name == "target_median_depth": std_name = "TBP_target_median_depth"
+                            elif col_name == "num_reads_mapped": std_name = "TBP_num_reads_mapped"
+                            elif col_name == "pct_reads_mapped": std_name = "TBP_pct_reads_mapped"
+                            elif col_name == "num_dr_variants": std_name = "TBP_num_dr_variants"
+                            elif col_name == "num_other_variants": std_name = "TBP_num_other_variants"
                             else:
-                                gdst_val = "S"
-                            tbp_derived_data.append(gdst_val)
-
-                        # 2. Prepare TBP Raw Data (Left Join)
-                        tbp_raw_data = tb_raw_rows.get(sample_id, ["-"] * tbp_raw_len)
-                        # Handle case where raw data length mismatch (e.g. missing sample in TBP)
-                        if len(tbp_raw_data) < tbp_raw_len:
-                            tbp_raw_data += ["-"] * (tbp_raw_len - len(tbp_raw_data))
-                        # Handle truncation safety
-                        if len(tbp_raw_data) > tbp_raw_len:
-                            tbp_raw_data = tbp_raw_data[:tbp_raw_len]
-
-                        # Combine all parts
-                        final_row_data = row + tbp_derived_data + tbp_raw_data
+                                std_name = f"TBP_{col_name}" # Default fallback prefix
                         
-                        # Clean all cell data before writing
-                        final_row_cleaned = [clean_text(c) for c in final_row_data]
-                        ws.append(final_row_cleaned)
+                        tbp_idx_map[i] = std_name
 
-                    wb.save(integrated_xlsx)
-                    print(f"[INFO] Integrated Excel report created: {integrated_xlsx}")
-            except ImportError:
-                print("[ERROR] 'openpyxl' library is required for Excel merging. Please install it.")
-            except Exception as e:
-                print(f"[ERROR] Failed to merge reports into Excel: {e}")
-                # Fallback to CSV
-                try:
-                    fallback_csv = integrated_xlsx.replace(".xlsx", ".csv")
-                    with open(fallback_csv, "w", newline="", encoding="utf-8") as f:
-                        writer = csv.writer(f)
-                        writer.writerow(["GenoMycAnalyzer-WGS"] + [""]*(gma_len-1) + ["TB-Profiler"])
-                        writer.writerow(gma_header + tbp_derived_header + tb_raw_header)
-                        for row in gma_rows:
-                            sample_id = row[0]
-                            
-                            # Duplicate logic for CSV
-                            tbp_derived_data = []
-                            sample_tb_data = tb_data.get(sample_id, {})
-                            for drug in TBP_DRUG_ORDER:
-                                mutation_val = sample_tb_data.get(drug, "-")
-                                if mutation_val and mutation_val != "-": gdst_val = "R"
-                                else: gdst_val = "S"
-                                tbp_derived_data.append(gdst_val)
-                            
-                            tbp_raw_data = tb_raw_rows.get(sample_id, ["-"] * tbp_raw_len)
-                            if len(tbp_raw_data) < tbp_raw_len: tbp_raw_data += ["-"] * (tbp_raw_len - len(tbp_raw_data))
-                            if len(tbp_raw_data) > tbp_raw_len: tbp_raw_data = tbp_raw_data[:tbp_raw_len]
+                    # Parse Rows
+                    for row in reader:
+                        if not row: continue
+                        sample_id = row[0]
+                        tb_records[sample_id] = {}
+                        for i, val in enumerate(row):
+                            if i in tbp_idx_map:
+                                tb_records[sample_id][tbp_idx_map[i]] = val
+        except Exception as e:
+             print(f"[ERROR] Reading TB-Profiler file failed: {e}")
 
-                            writer.writerow(row + tbp_derived_data + tbp_raw_data)
-                    print(f"[INFO] Saved as CSV fallback: {fallback_csv}")
-                except:
-                    print("[ERROR] CSV fallback also failed.")
+        # 2. Create Integrated Excel File (.xlsx)
+        integrated_xlsx = merged_tsv.replace(".gDST_summary.tsv", ".Integrated_Report.xlsx")
+        if integrated_xlsx == merged_tsv: integrated_xlsx += ".xlsx"
+        
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Alignment, Font, PatternFill
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Integrated Report"
+            
+            # Load GMA rows (Dictionary based for column lookup)
+            gma_dicts = []
+            with open(merged_tsv, "r", encoding="utf-8") as gma_f:
+                gma_reader = csv.reader(gma_f, delimiter="\t")
+                gma_header = next(gma_reader, None)
+                if gma_header:
+                    for row in gma_reader:
+                        row_dict = dict(zip(gma_header, row))
+                        gma_dicts.append(row_dict)
+            
+            # --- Row 1: Main Header (Styled) ---
+            # Use FINAL_COLUMN_ORDER
+            ws.append(FINAL_COLUMN_ORDER)
+            
+            # [MODIFIED] Conditional Background Colors
+            # TBP_ prefix -> #CCFFCC (Light Green)
+            # Others     -> #CCECFF (Light Blue)
+            fill_tbp = PatternFill(start_color="CCFFCC", end_color="CCFFCC", fill_type="solid")
+            fill_default = PatternFill(start_color="CCECFF", end_color="CCECFF", fill_type="solid")
+            
+            for col_num, col_name in enumerate(FINAL_COLUMN_ORDER, 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal='center')
+                
+                if col_name.startswith("TBP_"):
+                    cell.fill = fill_tbp
+                else:
+                    cell.fill = fill_default
+
+            # --- Row 2+: Data ---
+            for gma_row in gma_dicts:
+                sample_id = gma_row.get("Sample", "-")
+                tbp_row = tb_records.get(sample_id, None) # Get TB-Profiler data for this sample
+                
+                final_row_values = []
+                
+                for col in FINAL_COLUMN_ORDER:
+                    val = "-"
+                    
+                    # Logic 1: Value from GMA
+                    if col in gma_row:
+                        val = gma_row[col]
+                    
+                    # Logic 2: Value is TB-Profiler gDST (Derived)
+                    elif col.startswith("TBP_") and col.endswith("_gDST"):
+                        # Extract drug name (e.g. TBP_INH_gDST -> INH)
+                        parts = col.split("_")
+                        if len(parts) >= 3:
+                            drug_short = parts[1]
+                            
+                            # Check if Sample exists in TBP
+                            if tbp_row is None:
+                                val = "-" # [REQ] Missing sample -> "-"
+                            else:
+                                # Look up mutation column
+                                mut_col = f"TBP_{drug_short}_Mutation"
+                                mutation = tbp_row.get(mut_col, "-")
+                                
+                                # Default is Susceptible
+                                val = "S"
+                                
+                                # [MODIFIED] Check individual mutations split by comma
+                                if mutation and mutation != "-":
+                                    # Split by comma to handle multiple variants
+                                    # e.g. "*inhA..., katG..."
+                                    mut_parts = mutation.split(',')
+                                    
+                                    for part in mut_parts:
+                                        # Clean whitespace
+                                        clean_part = part.strip()
+                                        
+                                        # If ANY single variant does NOT start with '*', it is Resistance.
+                                        # (Ignore variants starting with '*' like '*inhA', 
+                                        #  but accept 'katG..._*...' where '*' is in the middle)
+                                        if clean_part and not clean_part.startswith("*"):
+                                            val = "R"
+                                            break
+                    
+                    # Logic 3: Value is TB-Profiler Raw/Metadata
+                    elif tbp_row and col in tbp_row:
+                         val = tbp_row[col]
+                    
+                    # Logic 4: Fallback for missing TBP data (Metadata/Mutations)
+                    elif tbp_row is None and col.startswith("TBP_"):
+                         val = "-"
+
+                    final_row_values.append(clean_text(val))
+                
+                ws.append(final_row_values)
+
+            wb.save(integrated_xlsx)
+            print(f"[INFO] Integrated Excel report created: {integrated_xlsx}")
+
+        except ImportError:
+            print("[ERROR] 'openpyxl' library is required for Excel merging.")
+        except Exception as e:
+            print(f"[ERROR] Failed to generate Excel: {e}")
 
 print("[INFO] All tasks completed.")
