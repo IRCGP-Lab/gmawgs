@@ -721,17 +721,34 @@ process_sample() {
       bcftools view -e '(DP4[2]+DP4[3]) < 4' "${RESULTS}/6_Variant_Call/${sample}_A.vcf" \
           > "${RESULTS}/6_Variant_Call/${sample}_N_ALT.vcf"
 
-      bedtools intersect -a "${RESULTS}/6_Variant_Call/${sample}_N_ALT.vcf" \
+      # [FIX] Added -header option to preserve VCF header
+      bedtools intersect -header -a "${RESULTS}/6_Variant_Call/${sample}_N_ALT.vcf" \
           -b "${GMA_SHARE}/WHODR_v2.bed" \
           > "${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
 
       # 4. Merge: (High-Conf MNV Merged) + (Low-Conf)
+      # [FIX] Overlap Removal Strategy
+      # Logic: Remove Low Conf variants (file2) that physically overlap with High Conf variants (file1)
       # Note: Using _filtered_1_sum.vcf instead of _filtered_1.vcf
+
+      HIGH_CONF_VCF="${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+      LOW_CONF_VCF="${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
+      CLEANED_LOW_CONF="${RESULTS}/6_Variant_Call/${sample}_1~3_cleaned.vcf"
+
+      # Use bedtools intersect -v to keep only Low Conf variants that DO NOT overlap High Conf variants
+      # Note: bedtools handles VCF intervals correctly (POS to POS + len(REF))
+      echo ">>> Removing Low-Conf variants overlapping with High-Conf variants..."
+      bedtools intersect -v \
+          -a "${LOW_CONF_VCF}" \
+          -b "${HIGH_CONF_VCF}" \
+          > "${CLEANED_LOW_CONF}"
+
+      # Now merge: High Conf + Cleaned Low Conf
       {
-        grep '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
+        grep '^#' "${HIGH_CONF_VCF}"
         {
-          grep -v '^#' "${RESULTS}/6_Variant_Call/${sample}_filtered_1_sum.vcf"
-          grep -v '^#' "${RESULTS}/6_Variant_Call/${sample}_1~3.vcf"
+          grep -v '^#' "${HIGH_CONF_VCF}"
+          grep -v '^#' "${CLEANED_LOW_CONF}"
         } | sort -k2,2n -u
       } > "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf"
 
@@ -739,6 +756,9 @@ process_sample() {
       bcftools view -e 'DP <= 30 || (DP4[2]+DP4[3])/(DP4[0]+DP4[1]+DP4[2]+DP4[3]) < 0.01 || (DP4[2]+DP4[3]) < 4' \
           "${RESULTS}/6_Variant_Call/${sample}_sorted_merge.vcf" \
           > "${RESULTS}/6_Variant_Call/${sample}_filtered.vcf"
+      
+      # Cleanup intermediate clean file
+      rm -f "${CLEANED_LOW_CONF}"
   fi
 
   ##############################################################################
